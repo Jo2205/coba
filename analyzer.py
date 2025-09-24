@@ -1,5 +1,6 @@
 import pandas as pd
 from datetime import datetime, time
+import re
 
 
 def load_and_prepare_data(file_path):
@@ -179,6 +180,64 @@ def is_integration_fare(fare_int):
     return fare_int > 3500
 
 
+def parse_terminal_name(terminal_name):
+    """
+    BARU: Parse nama terminal untuk ekstrak nama stasiun/terminal utama.
+    
+    Contoh:
+    - "GATE 1 Salemba" → "Salemba"
+    - "GATE 2 Salemba" → "Salemba"  
+    - "TOB Halte Bundaran Senayan" → "Bundaran Senayan"
+    
+    Parameters:
+        terminal_name (str): Nama terminal/gate lengkap
+    
+    Returns:
+        str: Nama terminal yang sudah dinormalisasi
+    """
+    if pd.isnull(terminal_name) or terminal_name == "UNKNOWN":
+        return ""
+    
+    terminal_name = str(terminal_name).strip().upper()
+    
+    # Pattern untuk ekstrak nama terminal utama
+    # Hilangkan "GATE [angka]", "TOB", "HALTE", dll
+    patterns = [
+        r'^GATE\s+\d+\s+(.+)$',      # "GATE 1 Salemba" → "Salemba"
+        r'^TOB\s+HALTE\s+(.+)$',     # "TOB HALTE Bundaran" → "Bundaran" 
+        r'^TOB\s+(.+)$',             # "TOB Salemba" → "Salemba"
+        r'^HALTE\s+(.+)$',           # "HALTE Salemba" → "Salemba"
+    ]
+    
+    for pattern in patterns:
+        match = re.match(pattern, terminal_name)
+        if match:
+            return match.group(1).strip()
+    
+    # Jika tidak cocok pattern, return terminal name asli
+    return terminal_name
+
+
+def is_same_terminal_group(terminal1, terminal2):
+    """
+    BARU: Cek apakah dua gate/terminal berada di terminal/stasiun yang sama.
+    
+    Parameters:
+        terminal1 (str): Terminal pertama
+        terminal2 (str): Terminal kedua
+    
+    Returns:
+        bool: True jika di terminal yang sama
+    """
+    parsed1 = parse_terminal_name(terminal1)
+    parsed2 = parse_terminal_name(terminal2)
+    
+    if not parsed1 or not parsed2:
+        return False
+    
+    return parsed1 == parsed2
+
+
 def normalize_terminal_name(terminal_name):
     """
     Normalisasi nama terminal untuk perbandingan.
@@ -198,14 +257,14 @@ def normalize_terminal_name(terminal_name):
 
 def is_same_terminal(terminal1, terminal2):
     """
-    Cek apakah dua terminal adalah terminal yang sama.
+    Cek apakah dua terminal adalah terminal yang sama persis.
     
     Parameters:
         terminal1 (str): Terminal pertama
         terminal2 (str): Terminal kedua
     
     Returns:
-        bool: True jika terminal sama
+        bool: True jika terminal sama persis
     """
     norm1 = normalize_terminal_name(terminal1)
     norm2 = normalize_terminal_name(terminal2)
@@ -215,13 +274,15 @@ def is_same_terminal(terminal1, terminal2):
 
 def get_trips_for_card(df, current_idx):
     """
-    REVISI: Deteksi perjalanan yang akurat sesuai logika TransJakarta.
+    REVISI MAJOR: Deteksi perjalanan yang akurat sesuai logika TransJakarta yang benar.
     
-    Logika:
-    - GATE IN → mulai perjalanan baru
-    - TOB IN dalam trip yang sama (dalam 4 jam)
-    - UNBLOKIR → pembayaran untuk perjalanan sebelumnya
-    - OUT → akhir perjalanan
+    Logika Baru:
+    1. GATE IN atau TOB IN → mulai perjalanan baru
+    2. GATE OUT atau TOB OUT → akhiri perjalanan 
+    3. Cross-platform OK: GATE IN → TOB OUT adalah 1 perjalanan
+    4. Cross-platform OK: TOB IN → GATE OUT adalah 1 perjalanan  
+    5. UNBLOKIR → tidak masuk trip, dianalisis terpisah
+    6. OUT selalu mengakhiri trip, transaksi berikutnya adalah trip baru
     
     Parameters:
         df (DataFrame): DataFrame semua transaksi
@@ -248,23 +309,28 @@ def get_trips_for_card(df, current_idx):
         trx_type = transaction["trx"]
         trx_time = transaction["trx_on"]
         
-        # 1. GATE IN = mulai perjalanan baru
-        if "GATE" in trx_type and "[IN]" in trx_type:
-            # Tutup trip sebelumnya jika ada
+        # 1. IN (GATE atau TOB) = mulai perjalanan baru
+        if "[IN]" in trx_type and ("GATE" in trx_type or "TOB" in trx_type):
+            # Tutup trip sebelumnya jika masih open (edge case)
             if current_trip and not current_trip.get("is_completed"):
                 current_trip["is_completed"] = True
                 trips.append(current_trip)
             
             # Mulai trip baru
+            trip_type = "GATE_IN" if "GATE" in trx_type else "TOB_IN"
             current_trip = {
                 "trip_id": len(trips) + 1,
                 "start_idx": original_idx,
                 "start_time": trx_time,
-                "start_type": "GATE_IN",
+                "start_type": trip_type,
+                "start_terminal": transaction["terminal_name_var"],
                 "transactions": [],
                 "payments_count": 0,
                 "is_paid": False,
-                "is_completed": False
+                "is_completed": False,
+                "end_time": None,
+                "end_type": None,
+                "end_terminal": None
             }
             
             # Tambahkan transaksi ke trip
@@ -272,43 +338,29 @@ def get_trips_for_card(df, current_idx):
                 "idx": original_idx,
                 "type": trx_type,
                 "time": trx_time,
+                "terminal": transaction["terminal_name_var"],
                 "is_payment": is_payment_transaction(transaction)
             })
             
-            # Cek apakah GATE IN ini juga payment
+            # Cek apakah IN ini juga payment
             if is_payment_transaction(transaction):
                 current_trip["payments_count"] += 1
                 current_trip["is_paid"] = True
         
-        # 2. TOB IN dalam trip yang sama
-        elif current_trip and "TOB" in trx_type and "[IN]" in trx_type:
-            time_gap_hours = (trx_time - current_trip["start_time"]).total_seconds() / 3600
-            
-            if time_gap_hours <= MAX_TRIP_HOURS:
-                # Masih dalam trip yang sama
-                current_trip["transactions"].append({
-                    "idx": original_idx,
-                    "type": trx_type,
-                    "time": trx_time,
-                    "is_payment": is_payment_transaction(transaction)
-                })
-                
-                if is_payment_transaction(transaction):
-                    current_trip["payments_count"] += 1
-                    current_trip["is_paid"] = True
-        
-        # 3. UNBLOKIR - tidak masuk ke trip, diproses terpisah
+        # 2. UNBLOKIR - tidak masuk ke trip, diproses terpisah
         elif "UNBLOKIR" in trx_type:
             # UNBLOKIR tidak masuk ke current_trip
             # Akan dianalisis di is_double_deduct()
             pass
         
-        # 4. OUT - akhiri trip
-        elif current_trip and "[OUT]" in trx_type:
+        # 3. OUT (GATE atau TOB) = akhiri trip
+        elif current_trip and "[OUT]" in trx_type and ("GATE" in trx_type or "TOB" in trx_type):
+            # Tambahkan transaksi OUT ke trip
             current_trip["transactions"].append({
                 "idx": original_idx,
                 "type": trx_type,
                 "time": trx_time,
+                "terminal": transaction["terminal_name_var"],
                 "is_payment": is_payment_transaction(transaction)
             })
             
@@ -316,10 +368,17 @@ def get_trips_for_card(df, current_idx):
                 current_trip["payments_count"] += 1
                 current_trip["is_paid"] = True
             
+            # AKHIRI TRIP - ini yang penting!
             current_trip["is_completed"] = True
             current_trip["end_time"] = trx_time
+            current_trip["end_type"] = "GATE_OUT" if "GATE" in trx_type else "TOB_OUT"
+            current_trip["end_terminal"] = transaction["terminal_name_var"]
+            
+            # Simpan trip yang sudah selesai
+            trips.append(current_trip)
+            current_trip = None  # Reset untuk trip berikutnya
     
-    # Simpan trip terakhir
+    # Handle trip terakhir yang belum completed
     if current_trip:
         # Auto-complete jika sudah lewat batas waktu
         if not current_trip["is_completed"]:
@@ -335,7 +394,7 @@ def get_trips_for_card(df, current_idx):
 
 def find_last_unpaid_trip(df, current_idx):
     """
-    Mencari perjalanan terakhir yang belum dibayar.
+    REVISI: Mencari perjalanan terakhir yang belum dibayar.
     UNBLOKIR bisa membayar trip ini.
     
     Parameters:
@@ -363,11 +422,11 @@ def find_last_unpaid_trip(df, current_idx):
 
 def is_double_deduct(df, idx):
     """
-    REVISI: Logika deteksi DD sesuai dengan penjelasan TransJakarta yang benar.
+    REVISI MAJOR: Logika deteksi DD sesuai dengan penjelasan yang benar.
     
     Logika DD:
     1. UNBLOKIR tanpa trip sebelumnya yang perlu dibayar = DD
-    2. UNBLOKIR bersamaan waktu dengan IN berikutnya = DD  
+    2. UNBLOKIR bersamaan waktu dengan IN berikutnya (< 5 menit, terminal sama) = DD  
     3. Payment ke-2+ dalam 1 trip yang sama = DD
     4. Tarif subsidi salah (3500 di jam 05:00-07:00) = DD
     5. UNBLOKIR membayar trip subsidi dengan tarif 3500 = DD
@@ -390,11 +449,11 @@ def is_double_deduct(df, idx):
         
         # === LOGIKA UNBLOKIR ===
         if "UNBLOKIR" in row["trx"]:
-            # Cek apakah UNBLOKIR bersamaan waktu dengan IN berikutnya
             current_card = row["card_number_var"]
             current_time = row["trx_on"]
+            current_terminal = row["terminal_name_var"]
             
-            # Cari IN dalam 5 menit setelah UNBLOKIR
+            # REVISI: Cek apakah UNBLOKIR bersamaan waktu dengan IN berikutnya (GAP TIMER)
             next_in = df[
                 (df["card_number_var"] == current_card) &
                 (df["trx_on"] > current_time) &
@@ -403,8 +462,13 @@ def is_double_deduct(df, idx):
             ]
             
             if not next_in.empty:
-                gap_seconds = (next_in.iloc[0]["trx_on"] - current_time).total_seconds()
-                return True, row["fare_int"], f"DD: UNBLOKIR bersamaan dengan IN (gap {gap_seconds:.0f}s)", is_integration
+                next_in_row = next_in.iloc[0]
+                gap_seconds = (next_in_row["trx_on"] - current_time).total_seconds()
+                next_terminal = next_in_row["terminal_name_var"]
+                
+                # Cek apakah di terminal yang sama (REVISI: terminal parsing)
+                if is_same_terminal_group(current_terminal, next_terminal):
+                    return True, row["fare_int"], f"DD: UNBLOKIR bersamaan dengan IN di terminal sama (gap {gap_seconds:.0f}s)", is_integration
             
             # Cari apakah ada trip sebelumnya yang belum dibayar
             unpaid_trip = find_last_unpaid_trip(df, idx)
@@ -559,3 +623,54 @@ def get_dd_summary(df):
         }
     
     return summary
+
+
+def debug_card_trips(df, card_number, debug=True):
+    """
+    BARU: Debug fungsi untuk melihat trip detection untuk satu kartu tertentu.
+    Berguna untuk testing dan troubleshooting.
+    
+    Parameters:
+        df (DataFrame): DataFrame transaksi
+        card_number (str): Nomor kartu yang ingin di-debug
+        debug (bool): Print detail atau tidak
+    
+    Returns:
+        list: List trips untuk kartu tersebut
+    """
+    card_data = df[df["card_number_var"] == card_number].sort_values("trx_on")
+    
+    if card_data.empty:
+        if debug:
+            print(f"Kartu {card_number} tidak ditemukan")
+        return []
+    
+    if debug:
+        print(f"\n=== DEBUG CARD {card_number} ===")
+        print(f"Total transaksi: {len(card_data)}")
+        
+        for idx, row in card_data.iterrows():
+            payment_status = "💰" if is_payment_transaction(row) else "⭕"
+            print(f"idx {idx:2d}: {row['trx_on'].strftime('%H:%M:%S')} | {row['trx']:15s} | {row['terminal_name_var']:20s} | {payment_status}")
+    
+    # Analisis trips untuk transaksi terakhir kartu ini
+    last_idx = card_data.index[-1]
+    trips = get_trips_for_card(df, last_idx)
+    
+    if debug:
+        print(f"\n=== TRIPS DETECTED ===")
+        for i, trip in enumerate(trips, 1):
+            status = "✅ Complete" if trip["is_completed"] else "🟡 Ongoing"
+            paid_status = "💰 Paid" if trip["is_paid"] else "❌ Unpaid"
+            
+            print(f"\nTrip {i}: {status} | {paid_status}")
+            print(f"  Start: idx {trip['start_idx']} | {trip['start_type']} | {trip.get('start_terminal', 'N/A')}")
+            if trip.get("end_time"):
+                print(f"  End:   {trip.get('end_type', 'N/A')} | {trip.get('end_terminal', 'N/A')}")
+            print(f"  Payments: {trip['payments_count']}")
+            
+            for trx in trip["transactions"]:
+                payment_mark = "💰" if trx["is_payment"] else "⭕"
+                print(f"    - idx {trx['idx']:2d}: {trx['type']} | {payment_mark}")
+    
+    return trips
