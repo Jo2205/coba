@@ -397,6 +397,11 @@ def find_last_unpaid_trip(df, current_idx):
     REVISI: Mencari perjalanan terakhir yang belum dibayar.
     UNBLOKIR bisa membayar trip ini.
     
+    Logika unpaid trip:
+    1. Trip dengan payments_count = 0 (tidak ada payment sama sekali)
+    2. Trip yang incomplete (tidak ada OUT) dan sudah lewat waktu wajar (>1 jam)
+    3. Trip yang hanya memiliki IN payment tapi tidak ada completion payment (OUT/UNBLOKIR)
+    
     Parameters:
         df (DataFrame): DataFrame semua transaksi
         current_idx (int): Index transaksi yang sedang dianalisis
@@ -405,6 +410,7 @@ def find_last_unpaid_trip(df, current_idx):
         dict or None: Info trip yang belum terbayar
     """
     trips = get_trips_for_card(df, current_idx)
+    current_time = df.loc[current_idx]["trx_on"]
     
     # Cari dari trip terbaru ke lama
     for trip in reversed(trips):
@@ -413,8 +419,26 @@ def find_last_unpaid_trip(df, current_idx):
         if contains_current:
             continue
         
-        # Trip belum dibayar jika payments_count = 0
+        # Kondisi 1: Trip belum dibayar sama sekali
         if trip["payments_count"] == 0:
+            return trip
+        
+        # Kondisi 2: Trip incomplete dan sudah lewat waktu wajar (> 1 jam)
+        if not trip["is_completed"]:
+            time_diff = (current_time - trip["start_time"]).total_seconds() / 3600
+            if time_diff > 1.0:  # Lebih dari 1 jam
+                return trip
+        
+        # Kondisi 3: Trip hanya ada IN payment, tidak ada completion payment (OUT/UNBLOKIR)
+        # Cek apakah ada payment selain IN di trip ini
+        has_completion_payment = False
+        for trx in trip["transactions"]:
+            if trx["is_payment"] and ("[OUT]" in trx["type"] or "UNBLOKIR" in trx["type"]):
+                has_completion_payment = True
+                break
+        
+        # Jika trip complete tapi hanya ada IN payment, masih dianggap perlu additional payment
+        if trip["is_completed"] and not has_completion_payment and trip["payments_count"] > 0:
             return trip
     
     return None
@@ -441,11 +465,18 @@ def is_double_deduct(df, idx):
     try:
         row = df.loc[idx]
         
-        # Hanya cek transaksi yang benar memotong saldo
-        if not is_payment_transaction(row):
-            return False, 0, "Bukan transaksi pembayaran", False
-        
-        is_integration = is_integration_fare(row["fare_int"])
+        # Khusus untuk UNBLOKIR: selalu analisis DD meskipun bukan payment transaction
+        if "UNBLOKIR" in row["trx"]:
+            # UNBLOKIR bisa berupa deduction (positive fare) atau refund (negative fare)
+            # Untuk analisis DD, kita gunakan absolute value dari fare
+            fare_amount = abs(row["fare_int"]) if not pd.isnull(row["fare_int"]) else 0
+            is_integration = is_integration_fare(fare_amount)
+        else:
+            # Untuk transaksi non-UNBLOKIR, hanya cek yang benar memotong saldo
+            if not is_payment_transaction(row):
+                return False, 0, "Bukan transaksi pembayaran", False
+            fare_amount = row["fare_int"]
+            is_integration = is_integration_fare(row["fare_int"])
         
         # === LOGIKA UNBLOKIR ===
         if "UNBLOKIR" in row["trx"]:
@@ -453,7 +484,13 @@ def is_double_deduct(df, idx):
             current_time = row["trx_on"]
             current_terminal = row["terminal_name_var"]
             
-            # REVISI: Cek apakah UNBLOKIR bersamaan waktu dengan IN berikutnya (GAP TIMER)
+            # Bedakan antara UNBLOKIR deduction vs refund
+            is_deduction = bool(row.get("deduct_boo", False))
+            
+            # PRIORITAS 1: Cari apakah ada trip sebelumnya yang belum dibayar
+            unpaid_trip = find_last_unpaid_trip(df, idx)
+            
+            # PRIORITAS 2: Cek apakah UNBLOKIR bersamaan waktu dengan IN berikutnya (GAP TIMER)
             next_in = df[
                 (df["card_number_var"] == current_card) &
                 (df["trx_on"] > current_time) &
@@ -461,6 +498,8 @@ def is_double_deduct(df, idx):
                 (df["trx"].str.contains(r"\[IN\]", na=False))
             ]
             
+            concurrent_with_next_in = False
+            concurrent_reason = ""
             if not next_in.empty:
                 next_in_row = next_in.iloc[0]
                 gap_seconds = (next_in_row["trx_on"] - current_time).total_seconds()
@@ -468,20 +507,33 @@ def is_double_deduct(df, idx):
                 
                 # Cek apakah di terminal yang sama (REVISI: terminal parsing)
                 if is_same_terminal_group(current_terminal, next_terminal):
-                    return True, row["fare_int"], f"DD: UNBLOKIR bersamaan dengan IN di terminal sama (gap {gap_seconds:.0f}s)", is_integration
+                    concurrent_with_next_in = True
+                    concurrent_reason = f"DD: UNBLOKIR bersamaan dengan IN di terminal sama (gap {gap_seconds:.0f}s)"
             
-            # Cari apakah ada trip sebelumnya yang belum dibayar
-            unpaid_trip = find_last_unpaid_trip(df, idx)
-            
-            if unpaid_trip:
-                # Ada trip yang belum dibayar - UNBLOKIR sah, tapi cek subsidi
-                if is_subsidi_time(unpaid_trip["start_time"]) and row["fare_int"] == 3500:
-                    return True, 1500, f"DD Subsidi: UNBLOKIR bayar trip subsidi idx {unpaid_trip['start_idx']}, seharusnya 2000", is_integration
+            # Logika keputusan berdasarkan jenis UNBLOKIR:
+            if is_deduction:
+                # UNBLOKIR deduction: Prioritaskan concurrent timing rule
+                if concurrent_with_next_in:
+                    return True, fare_amount, concurrent_reason, is_integration
+                elif unpaid_trip:
+                    # Cek subsidi untuk deduction
+                    if is_subsidi_time(unpaid_trip["start_time"]) and fare_amount == 3500:
+                        return True, 1500, f"DD Subsidi: UNBLOKIR bayar trip subsidi idx {unpaid_trip['start_idx']}, seharusnya 2000", is_integration
+                    else:
+                        return False, 0, f"Sah: UNBLOKIR bayar trip idx {unpaid_trip['start_idx']}", is_integration
                 else:
-                    return False, 0, f"Sah: UNBLOKIR bayar trip idx {unpaid_trip['start_idx']}", is_integration
+                    return True, fare_amount, "DD: UNBLOKIR tanpa trip yang perlu dibayar", is_integration
             else:
-                # Tidak ada trip yang perlu dibayar - DD
-                return True, row["fare_int"], "DD: UNBLOKIR tanpa trip yang perlu dibayar", is_integration
+                # UNBLOKIR refund: Prioritaskan unpaid trip rule (likely genuine correction)
+                if unpaid_trip:
+                    if is_subsidi_time(unpaid_trip["start_time"]) and fare_amount == 3500:
+                        return True, 1500, f"DD Subsidi: UNBLOKIR bayar trip subsidi idx {unpaid_trip['start_idx']}, seharusnya 2000", is_integration
+                    else:
+                        return False, 0, f"Sah: UNBLOKIR refund untuk trip idx {unpaid_trip['start_idx']}", is_integration
+                elif concurrent_with_next_in:
+                    return True, fare_amount, concurrent_reason, is_integration
+                else:
+                    return True, fare_amount, "DD: UNBLOKIR refund tanpa justifikasi", is_integration
         
         # === LOGIKA IN/OUT dalam trip ===
         trips = get_trips_for_card(df, idx)
@@ -502,10 +554,10 @@ def is_double_deduct(df, idx):
         
         if current_trip and payment_order_in_trip > 1:
             # Payment ke-2, ke-3, dst dalam trip yang sama = DD
-            return True, row["fare_int"], f"DD: Payment ke-{payment_order_in_trip} dalam trip idx {current_trip['start_idx']}", is_integration
+            return True, fare_amount, f"DD: Payment ke-{payment_order_in_trip} dalam trip idx {current_trip['start_idx']}", is_integration
         
         # === CEK SUBSIDI untuk payment normal ===
-        if is_subsidi_time(row["trx_on"]) and row["fare_int"] == 3500:
+        if is_subsidi_time(row["trx_on"]) and fare_amount == 3500:
             return True, 1500, "DD Subsidi: Jam 05:00-07:00 seharusnya tarif 2000", is_integration
         
         return False, 0, "Sah: Payment normal", is_integration
