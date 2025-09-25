@@ -136,12 +136,13 @@ def is_payment_transaction(row):
 
 def is_subsidi_time(trx_time):
     """
-    IMPROVED: Cek apakah transaksi terjadi di jam subsidi pagi (05:00-07:00).
+    IMPROVED: Cek apakah transaksi terjadi di jam subsidi pagi (05:00-07:00 inclusive).
     Pada jam ini tarif seharusnya 2000, bukan 3500.
     
     Perbaikan:
     - Validasi input yang lebih robust
     - Handling timezone dan edge cases
+    - Fix: Include jam 07:00:00 dalam periode subsidi
     
     Parameters:
         trx_time (datetime): Waktu transaksi
@@ -158,10 +159,17 @@ def is_subsidi_time(trx_time):
             return False
         
         hour = trx_time.hour
+        minute = trx_time.minute
+        second = trx_time.second
         
-        # Subsidi berlaku 05:00:00 - 06:59:59
-        # (tidak termasuk 07:00:00 ke atas)
-        return (hour == 5) or (hour == 6)
+        # Subsidi berlaku 05:00:00 - 07:00:00 (inclusive)
+        # Include jam 07:00:00 exactly, but not after
+        if hour == 5 or hour == 6:
+            return True
+        elif hour == 7 and minute == 0 and second == 0:
+            return True
+        else:
+            return False
         
     except (AttributeError, ValueError):
         return False
@@ -392,7 +400,66 @@ def get_trips_for_card(df, current_idx):
     return trips
 
 
-def find_last_unpaid_trip(df, current_idx):
+def detect_in_in_case(df, current_idx):
+    """
+    IMPROVED: Mendeteksi kasus IN-IN untuk handling UNBLOKIR yang benar.
+    
+    IN-IN case terjadi ketika ada dua transaksi IN berturut-turut tanpa OUT di antaranya.
+    Dalam kasus ini, UNBLOKIR harus di-refund karena merupakan koreksi, bukan pembayaran perjalanan.
+    
+    Parameters:
+        df (DataFrame): DataFrame semua transaksi  
+        current_idx (int): Index transaksi UNBLOKIR yang sedang dianalisis
+        
+    Returns:
+        dict or None: Info tentang IN-IN case jika ditemukan
+    """
+    try:
+        current_row = df.loc[current_idx]
+        current_card = current_row["card_number_var"]
+        current_time = current_row["trx_on"]
+        
+        # Ambil transaksi sebelum UNBLOKIR untuk kartu yang sama
+        previous_transactions = df[
+            (df["card_number_var"] == current_card) &
+            (df["trx_on"] < current_time) &
+            (df.index < current_idx)
+        ].sort_values(by="trx_on", ascending=False)
+        
+        if len(previous_transactions) < 2:
+            return None
+            
+        # Cari pola IN-IN terakhir
+        in_count = 0
+        last_in_idx = None
+        
+        for idx, row in previous_transactions.iterrows():
+            trx_type = row["trx"]
+            
+            if "[IN]" in trx_type and ("GATE" in trx_type or "TOB" in trx_type):
+                in_count += 1
+                if in_count == 1:
+                    last_in_idx = idx
+                elif in_count == 2:
+                    # Found IN-IN pattern
+                    return {
+                        "is_in_in_case": True,
+                        "first_in_idx": idx,
+                        "second_in_idx": last_in_idx,
+                        "first_in_time": row["trx_on"],
+                        "second_in_time": previous_transactions.loc[last_in_idx]["trx_on"]
+                    }
+            elif "[OUT]" in trx_type or "UNBLOKIR" in trx_type:
+                # Found OUT or UNBLOKIR, reset counter
+                in_count = 0
+                last_in_idx = None
+                
+        return None
+        
+    except Exception as e:
+        return None
+
+
     """
     REVISI: Mencari perjalanan terakhir yang belum dibayar.
     UNBLOKIR bisa membayar trip ini.
@@ -490,7 +557,11 @@ def is_double_deduct(df, idx):
             # PRIORITAS 1: Cari apakah ada trip sebelumnya yang belum dibayar
             unpaid_trip = find_last_unpaid_trip(df, idx)
             
+            # PRIORITAS 1.5: Check for IN-IN case (IMPROVED handling)
+            in_in_case = detect_in_in_case(df, idx)
+            
             # PRIORITAS 2: Cek apakah UNBLOKIR bersamaan waktu dengan IN berikutnya (GAP TIMER)
+            # Improved: Detect exact concurrent timing (same time) and near-concurrent
             next_in = df[
                 (df["card_number_var"] == current_card) &
                 (df["trx_on"] > current_time) &
@@ -498,9 +569,29 @@ def is_double_deduct(df, idx):
                 (df["trx"].str.contains(r"\[IN\]", na=False))
             ]
             
+            # Also check for exactly concurrent transactions (same timestamp)
+            concurrent_in = df[
+                (df["card_number_var"] == current_card) &
+                (df["trx_on"] == current_time) &
+                (df.index > idx) &  # Only check transactions after current one
+                (df["trx"].str.contains(r"\[IN\]", na=False))
+            ]
+            
             concurrent_with_next_in = False
             concurrent_reason = ""
-            if not next_in.empty:
+            
+            # Check for exactly concurrent transactions first (same timestamp)
+            if not concurrent_in.empty:
+                concurrent_in_row = concurrent_in.iloc[0]
+                concurrent_terminal = concurrent_in_row["terminal_name_var"]
+                
+                # Same time, same terminal = definitely DD
+                if is_same_terminal_group(current_terminal, concurrent_terminal):
+                    concurrent_with_next_in = True
+                    concurrent_reason = f"DD: UNBLOKIR bersamaan PERSIS dengan IN di terminal sama (gap 0s)"
+                
+            # If not exactly concurrent, check for near-concurrent (within 5 minutes)
+            elif not next_in.empty:
                 next_in_row = next_in.iloc[0]
                 gap_seconds = (next_in_row["trx_on"] - current_time).total_seconds()
                 next_terminal = next_in_row["terminal_name_var"]
@@ -515,6 +606,9 @@ def is_double_deduct(df, idx):
                 # UNBLOKIR deduction: Prioritaskan concurrent timing rule
                 if concurrent_with_next_in:
                     return True, fare_amount, concurrent_reason, is_integration
+                elif in_in_case and in_in_case["is_in_in_case"]:
+                    # IN-IN case: UNBLOKIR harus di-refund (DD)
+                    return True, fare_amount, f"DD: UNBLOKIR dalam IN-IN case (idx {in_in_case['first_in_idx']}-{in_in_case['second_in_idx']})", is_integration
                 elif unpaid_trip:
                     # Cek subsidi untuk deduction
                     if is_subsidi_time(unpaid_trip["start_time"]) and fare_amount == 3500:
@@ -524,8 +618,11 @@ def is_double_deduct(df, idx):
                 else:
                     return True, fare_amount, "DD: UNBLOKIR tanpa trip yang perlu dibayar", is_integration
             else:
-                # UNBLOKIR refund: Prioritaskan unpaid trip rule (likely genuine correction)
-                if unpaid_trip:
+                # UNBLOKIR refund: Handle IN-IN case differently
+                if in_in_case and in_in_case["is_in_in_case"]:
+                    # IN-IN case: UNBLOKIR refund adalah koreksi yang sah
+                    return False, 0, f"Sah: UNBLOKIR refund koreksi IN-IN case (idx {in_in_case['first_in_idx']}-{in_in_case['second_in_idx']})", is_integration
+                elif unpaid_trip:
                     if is_subsidi_time(unpaid_trip["start_time"]) and fare_amount == 3500:
                         return True, 1500, f"DD Subsidi: UNBLOKIR bayar trip subsidi idx {unpaid_trip['start_idx']}, seharusnya 2000", is_integration
                     else:
@@ -545,16 +642,18 @@ def is_double_deduct(df, idx):
             for i, transaction in enumerate(trip["transactions"]):
                 if transaction["idx"] == idx:
                     current_trip = trip
-                    # Hitung urutan payment dalam trip
+                    # Hitung urutan payment dalam trip (IMPROVED: more robust counting)
                     payments_before = sum(1 for t in trip["transactions"][:i+1] if t["is_payment"])
                     payment_order_in_trip = payments_before
                     break
             if current_trip:
                 break
         
+        # IMPROVED: Stronger multiple payment detection
         if current_trip and payment_order_in_trip > 1:
             # Payment ke-2, ke-3, dst dalam trip yang sama = DD
-            return True, fare_amount, f"DD: Payment ke-{payment_order_in_trip} dalam trip idx {current_trip['start_idx']}", is_integration
+            total_payments = sum(1 for t in current_trip["transactions"] if t["is_payment"])
+            return True, fare_amount, f"DD: Payment ke-{payment_order_in_trip} dari {total_payments} dalam trip idx {current_trip['start_idx']}", is_integration
         
         # === CEK SUBSIDI untuk payment normal ===
         if is_subsidi_time(row["trx_on"]) and fare_amount == 3500:
